@@ -62,7 +62,7 @@ HAND_CRICKET/
 ## Setup
 
 ### If using the plain-TCP version (no encryption)
-No extra setup needed — just run the scripts directly. Traffic between client and server is **unencrypted**; see [Security Note](#security-note).
+No extra setup needed — just run the scripts directly.
 
 ### If using the TLS/SSL-enabled version
 The server expects a certificate and private key at:
