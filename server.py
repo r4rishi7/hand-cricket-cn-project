@@ -1,6 +1,8 @@
 import socket as x
+import ssl
 import select
 import engine
+from pathlib import Path
 from protocols import Protocols as protocol
 
 class HandCricketServer:
@@ -13,16 +15,31 @@ class HandCricketServer:
         self.player1_name = ""
         self.player2_name = ""
         self.state = "REGISTERING"
-        # Toss phase variables
-        self.p1_toss_choice = None  # "ODD" or "EVEN"
+        self.p1_toss_choice = None
         self.p1_toss_num = None
         self.p2_toss_num = None
-        # Play phase variables
         self.p1_play_num = None
         self.p2_play_num = None
-        # Replay phase variables
         self.p1_replay = None
         self.p2_replay = None
+
+        # ── Per-socket line-buffers ──────────────────────────────────────
+        # TLS (and TCP under it) is a byte stream, not a message stream.
+        # Multiple sends from a client can arrive in one recv(), and one
+        # send can arrive split across multiple recv()s. We terminate every
+        # client message with "\n" (see client.py) and buffer here until we
+        # have at least one full line, then process exactly one command at
+        # a time. This is the fix for the "messages getting mashed together"
+        # bug that looked like an SSL issue but wasn't.
+        self._recv_buf = {}  # socket -> str (partial, unterminated data)
+
+        # ── SSL context (server-side identity, no client-cert auth) ─────
+        self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        cert_path = Path(__file__).parent / "certs" / "server.crt"
+        key_path = Path(__file__).parent / "certs" / "server.key"
+        self.ssl_context.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+        # Pin a sane minimum so handshakes are predictable across client/server.
+        self.ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
 
     def send_msg(self, player, msg):
         if player:
@@ -43,6 +60,7 @@ class HandCricketServer:
                     player.close()
                 except Exception:
                     pass
+                self._recv_buf.pop(player, None)
         self.player1 = None
         self.player2 = None
 
@@ -106,7 +124,8 @@ class HandCricketServer:
             else:
                 self.send_msg(player, protocol.ERROR_INVALID_CMD)
             return
-        elif self.state == "TOSS":
+
+        if self.state == "TOSS":
             if cmd == "TOSS":
                 if player == self.player1:
                     if len(args) < 2:
@@ -159,7 +178,7 @@ class HandCricketServer:
                 self.send_msg(player, protocol.ERROR_INVALID_CMD)
                 return
 
-        elif self.state == "TOSS_DECISION":
+        if self.state == "TOSS_DECISION":
             if cmd == "DECIDE":
                 toss_winner_name = self.engine.toss_winner
                 toss_winner_player = self.player1 if toss_winner_name == self.player1_name else self.player2
@@ -185,7 +204,7 @@ class HandCricketServer:
                 self.send_msg(player, protocol.ERROR_INVALID_CMD)
             return
 
-        elif self.state == "PLAYING_INNINGS_1":
+        if self.state == "PLAYING_INNINGS_1":
             if cmd == "PLAY":
                 if len(args) < 1:
                     self.send_msg(player, protocol.ERROR_INVALID_VAL)
@@ -231,7 +250,7 @@ class HandCricketServer:
                 self.send_msg(player, protocol.ERROR_INVALID_CMD)
             return
 
-        elif self.state == "PLAYING_INNINGS_2":
+        if self.state == "PLAYING_INNINGS_2":
             if cmd == "PLAY":
                 if len(args) < 1:
                     self.send_msg(player, protocol.ERROR_INVALID_VAL)
@@ -282,7 +301,7 @@ class HandCricketServer:
                 self.send_msg(player, protocol.ERROR_INVALID_CMD)
             return
 
-        elif self.state == "GAME_OVER":
+        if self.state == "GAME_OVER":
             val = msg.strip().upper()
             if val in ["PLAY_AGAIN", "PLAY AGAIN"]:
                 if player == self.player1:
@@ -311,67 +330,107 @@ class HandCricketServer:
                 self.send_msg(player, "Invalid choice. Please select: PLAY_AGAIN or EXIT\n")
             return
 
+    def _drain_socket(self, sock):
+        """
+        Read whatever is available from sock, append to its buffer, split
+        on '\\n', and return the list of complete messages (without the
+        trailing newline). Any trailing partial line stays buffered for
+        next time. Returns None if the peer disconnected.
+        """
+        data = sock.recv(4096)
+        if not data:
+            return None  # peer closed
+        text = data.decode(errors="ignore")
+        self._recv_buf[sock] = self._recv_buf.get(sock, "") + text
+        lines = self._recv_buf[sock].split("\n")
+        # last element is the (possibly empty) unterminated remainder
+        self._recv_buf[sock] = lines[-1]
+        complete = [l for l in lines[:-1]]
+        return complete
+
     def start(self):
         server_sock = x.socket(x.AF_INET, x.SOCK_STREAM)
         server_sock.setsockopt(x.SOL_SOCKET, x.SO_REUSEADDR, 1)
         server_sock.bind((self.host, self.port))
-        server_sock.listen()
+        server_sock.listen(2)
         print(f"Server started on {self.host}:{self.port}")
-        
+
         while True:
             try:
                 print("Waiting for player 1...")
-                print("Before accept")
                 raw1, addr1 = server_sock.accept()
-                print("Accepted", addr1)
-                self.player1 = raw1
-                print(f"Player 1 connected from {addr1}")
-                self.send_msg(self.player1, protocol.WELCOME_MSG)
-                self.send_msg(self.player1, "You are Player 1.\n")
-                
+                print(f"  TCP connection from {addr1}")
+                try:
+                    self.player1 = self.ssl_context.wrap_socket(raw1, server_side=True)
+                except ssl.SSLError as e:
+                    print(f"[SSL] Player 1 handshake failed: {e}")
+                    try: raw1.close()
+                    except: pass
+                    continue
+                print("[SSL] Handshake completed with Player 1")
+
                 print("Waiting for player 2...")
                 raw2, addr2 = server_sock.accept()
-                print("Accepted", addr2)
-                self.player2 = raw2
-                print(f"Player 2 connected from {addr2}")
+                print(f"  TCP connection from {addr2}")
+                try:
+                    self.player2 = self.ssl_context.wrap_socket(raw2, server_side=True)
+                except ssl.SSLError as e:
+                    print(f"[SSL] Player 2 handshake failed: {e}")
+                    try: raw2.close()
+                    except: pass
+                    continue
+                print("[SSL] Handshake completed with Player 2")
+
+                self.send_msg(self.player1, protocol.WELCOME_MSG)
+                self.send_msg(self.player1, "You are Player 1.\n")
                 self.send_msg(self.player2, protocol.WELCOME_MSG)
                 self.send_msg(self.player2, "You are Player 2.\n")
-                
-                self.player1_name = ""
-                self.player2_name = ""
-                self.state = "REGISTERING"
+
+                self.player1_name  = ""
+                self.player2_name  = ""
+                self.state         = "REGISTERING"
                 self.p1_toss_choice = None
-                self.p1_toss_num = None
-                self.p2_toss_num = None
-                self.p1_play_num = None
-                self.p2_play_num = None
-                self.p1_replay = None
-                self.p2_replay = None
-                
+                self.p1_toss_num   = None
+                self.p2_toss_num   = None
+                self.p1_play_num   = None
+                self.p2_play_num   = None
+                self.p1_replay     = None
+                self.p2_replay     = None
+
                 self.broadcast("Both players connected! Please register your names to begin.\n")
                 self.send_msg(self.player1, protocol.PROMPT_NAME)
                 self.send_msg(self.player2, protocol.PROMPT_NAME)
-                
+
                 while True:
                     readable, _, _ = select.select([self.player1, self.player2], [], [])
                     disconnect = False
                     for sock in readable:
                         try:
-                            data = sock.recv(4096).decode()
-                            if not data:
+                            messages = self._drain_socket(sock)
+                            if messages is None:
+                                winner_name = self.player2_name if sock == self.player1 else self.player1_name
+                                self.broadcast(f"\nA player disconnected. {winner_name or 'Opponent'} wins!\n")
+                                self.close_connections()
                                 disconnect = True
                                 break
-                            self.handle_player_message(sock, data)
+                            for line in messages:
+                                if line.strip():
+                                    self.handle_player_message(sock, line)
+                                if self.state == "CLOSED":
+                                    break
                         except Exception as e:
                             print(f"Error reading from player socket: {e}")
+                            self.close_connections()
                             disconnect = True
                             break
                     if disconnect or self.state == "CLOSED":
                         break
+
             except Exception as e:
                 print(f"Server error: {e}")
             finally:
                 self.close_connections()
+
 def start_server(host, port):
     server = HandCricketServer(host, port)
     server.start()
