@@ -1,6 +1,7 @@
 import socket as x
 import ssl
 import select
+import time
 import engine
 from pathlib import Path
 from protocols import Protocols as protocol
@@ -33,6 +34,28 @@ class HandCricketServer:
         # bug that looked like an SSL issue but wasn't.
         self._recv_buf = {}  # socket -> str (partial, unterminated data)
 
+        # ── Match logging ────────────────────────────────────────────────
+        # game_number is a server-lifetime counter (not reset between
+        # connections or PLAY_AGAIN), so match_logs.txt builds up a
+        # continuous history of every game ever played:
+        #   game1
+        #   inn1
+        #   Alice bats 5 Bob bowls 3
+        #   ...
+        #   inn2
+        #   ...
+        #   result: Alice wins (defended target)
+        #   game2
+        #   ...
+        self.game_number = 0
+        self.innings_number = 0
+        self.match_log_path = Path(__file__).resolve().parent / "match_logs.txt"
+
+        # ── 45-second "opponent forfeits if they don't respond" timer ───
+        # Set whenever one player has submitted PLAY but the other hasn't.
+        # Cleared as soon as both have played (or the match/innings ends).
+        self.play_deadline = None
+
         # ── SSL context (server-side identity, no client-cert auth) ─────
         self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         cert_path = Path(__file__).parent / "certs" / "server.crt"
@@ -54,6 +77,7 @@ class HandCricketServer:
 
     def close_connections(self):
         self.state = "CLOSED"
+        self.play_deadline = None
         for player in [self.player1, self.player2]:
             if player:
                 try:
@@ -63,6 +87,59 @@ class HandCricketServer:
                 self._recv_buf.pop(player, None)
         self.player1 = None
         self.player2 = None
+
+    # ── Match log helpers ────────────────────────────────────────────────
+    def _log_line(self, line):
+        """Append one line to match_logs.txt. Never lets logging crash the game."""
+        try:
+            with open(self.match_log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception as e:
+            print(f"[MatchLog] Failed to write log: {e}")
+
+    def _start_new_game_log(self):
+        self.game_number += 1
+        self.innings_number = 0
+        self._log_line(f"game{self.game_number}")
+
+    # ── 45s forfeit-timer helper ───────────────────────────────────────────
+    def _check_play_timeout(self):
+        """
+        Called every loop tick. If one player has played and the other
+        hasn't responded within 45 seconds, the player who responded wins
+        the match by default.
+        """
+        if self.play_deadline is None:
+            return
+        if self.player1 is None or self.player2 is None:
+            self.play_deadline = None
+            return
+        if self.state not in ("PLAYING_INNINGS_1", "PLAYING_INNINGS_2"):
+            self.play_deadline = None
+            return
+        if time.time() < self.play_deadline:
+            return
+
+        if self.p1_play_num is not None and self.p2_play_num is None:
+            winner_name = self.player1_name or "Player 1"
+            loser_name = self.player2_name or "Player 2"
+        elif self.p2_play_num is not None and self.p1_play_num is None:
+            winner_name = self.player2_name or "Player 2"
+            loser_name = self.player1_name or "Player 1"
+        else:
+            self.play_deadline = None
+            return
+
+        self.broadcast(
+            f"\n⏱ Time exceeded! {loser_name} did not respond within 45 seconds.\n"
+            f"  {winner_name} wins the match by default!\n\n"
+            f"Do you want to play again? Enter: PLAY_AGAIN or EXIT\n"
+        )
+        self._log_line(f"result: {winner_name} wins (opponent timeout)")
+        self.p1_play_num = None
+        self.p2_play_num = None
+        self.play_deadline = None
+        self.state = "GAME_OVER"
 
     def handle_player_message(self, player, msg):
         parts = msg.strip().split()
@@ -75,7 +152,17 @@ class HandCricketServer:
             self.send_msg(player, protocol.HELP_TXT)
             return
         if cmd == "EXIT":
-            self.broadcast("\nOne of the players has exited. Closing connections...\n")
+            # ── Abandonment handling ──────────────────────────────────────
+            # Whoever sent EXIT forfeits; the other player is declared the
+            # winner by default, regardless of what state the match was in.
+            exiter_name = self.player1_name if player == self.player1 else self.player2_name
+            winner_name = self.player2_name if player == self.player1 else self.player1_name
+            if not exiter_name:
+                exiter_name = "Player 1" if player == self.player1 else "Player 2"
+            if not winner_name:
+                winner_name = "Player 2" if player == self.player1 else "Player 1"
+            self.broadcast(f"\n{exiter_name} has abandoned the match. {winner_name} wins by default!\n\nClosing connections...\n")
+            self._log_line(f"result: {winner_name} wins (opponent abandoned)")
             self.close_connections()
             return
         if cmd == "CHAT":
@@ -118,6 +205,7 @@ class HandCricketServer:
                     self.engine.set_player(name)
                     self.send_msg(self.player2, f"Successfully registered as: {name}\n")
                     self.broadcast(f"Both players registered!\n  Player 1: {self.player1_name}\n  Player 2: {self.player2_name}\n")
+                    self._start_new_game_log()
                     self.state = "TOSS"
                     self.send_msg(self.player1, protocol.PROMPT_TOSS_P1)
                     self.send_msg(self.player2, f"Waiting for {self.player1_name} to choose ODD/EVEN for the toss...\n")
@@ -198,6 +286,8 @@ class HandCricketServer:
                     batting_player = self.player2_name if toss_winner_name == self.player1_name else self.player1_name
                 self.engine.set_roles(batting_player)
                 self.broadcast(f"\nGame roles decided:\n  Batter: {self.engine.batting_player}\n  Bowler: {self.engine.bowling_player}\n\nLet the game begin!\n")
+                self.innings_number = 1
+                self._log_line(f"inn{self.innings_number}")
                 self.state = "PLAYING_INNINGS_1"
                 self.broadcast(protocol.PROMPT_PLAY)
             else:
@@ -229,18 +319,33 @@ class HandCricketServer:
                         return
                     self.p2_play_num = num
                     self.send_msg(player, f"You threw {num}.\n")
+
+                # ── 45s forfeit timer: start/keep it running as soon as one
+                # side has played and the other hasn't yet ────────────────
+                if self.p1_play_num is not None and self.p2_play_num is None:
+                    self.play_deadline = time.time() + 45
+                    self.send_msg(self.player2, f"\n⏳ {self.player1_name} has played. Respond within 45 seconds or you forfeit the match.\n")
+                elif self.p2_play_num is not None and self.p1_play_num is None:
+                    self.play_deadline = time.time() + 45
+                    self.send_msg(self.player1, f"\n⏳ {self.player2_name} has played. Respond within 45 seconds or you forfeit the match.\n")
+
                 if self.p1_play_num is not None and self.p2_play_num is not None:
                     if self.engine.batting_player == self.player1_name:
                         bat_num, bowl_num = self.p1_play_num, self.p2_play_num
                     else:
                         bat_num, bowl_num = self.p2_play_num, self.p1_play_num
                     is_out, runs_scored = self.engine.play_turn(bat_num, bowl_num)
+                    self._log_line(f"{self.engine.batting_player} bats {bat_num} {self.engine.bowling_player} bowls {bowl_num}")
                     self.p1_play_num = None
                     self.p2_play_num = None
+                    self.play_deadline = None
                     if is_out:
-                        self.engine.transition_to_second_innings()
                         self.broadcast(f"\nOUT! Match update:\n  {self.engine.bowling_player} got {self.engine.batting_player} out!\n  First Innings Score: {self.engine.target - 1} runs.\n  Target for second innings: {self.engine.target} runs.\n\nRoles swapped!\n  New Batter: {self.engine.batting_player}\n  New Bowler: {self.engine.bowling_player}\n\n")
+                        self.engine.transition_to_second_innings()  
+                        self.innings_number = 2
+                        self._log_line(f"inn{self.innings_number}")
                         self.state = "PLAYING_INNINGS_2"
+                        self.broadcast("Now batting: " + self.engine.batting_player + " (Player " + str(2 if self.engine.batting_player == self.player2_name else 1) + ")\n")
                         self.broadcast(protocol.PROMPT_PLAY)
                     else:
                         bat_score = self.engine.player1_score if self.engine.batting_player == self.player1_name else self.engine.player2_score
@@ -275,24 +380,37 @@ class HandCricketServer:
                         return
                     self.p2_play_num = num
                     self.send_msg(player, f"You threw {num}.\n")
+
+                # ── 45s forfeit timer (same logic as innings 1) ─────────────
+                if self.p1_play_num is not None and self.p2_play_num is None:
+                    self.play_deadline = time.time() + 45
+                    self.send_msg(self.player2, f"\n⏳ {self.player1_name} has played. Respond within 45 seconds or you forfeit the match.\n")
+                elif self.p2_play_num is not None and self.p1_play_num is None:
+                    self.play_deadline = time.time() + 45
+                    self.send_msg(self.player1, f"\n⏳ {self.player2_name} has played. Respond within 45 seconds or you forfeit the match.\n")
+
                 if self.p1_play_num is not None and self.p2_play_num is not None:
                     if self.engine.batting_player == self.player1_name:
                         bat_num, bowl_num = self.p1_play_num, self.p2_play_num
                     else:
                         bat_num, bowl_num = self.p2_play_num, self.p1_play_num
                     is_out, runs_scored = self.engine.play_turn(bat_num, bowl_num)
+                    self._log_line(f"{self.engine.batting_player} bats {bat_num} {self.engine.bowling_player} bowls {bowl_num}")
                     self.p1_play_num = None
                     self.p2_play_num = None
+                    self.play_deadline = None
                     if is_out:
                         winner = self.engine.end_second_innings_by_out()
                         bat_score = self.engine.player1_score if self.engine.batting_player == self.player1_name else self.engine.player2_score
-                        self.broadcast(f"\nOUT! Match update:\n  Batter threw {bat_num}, Bowler threw {bowl_num}.\n  Second Innings Score: {bat_score} runs.\n  Target: {self.engine.target} runs.\n\n=========================================\n  MATCH OVER! WINNER: {winner}\n=========================================\n\nDo you want to play again? Enter: PLAY_AGAIN or EXIT\n")
+                        self.broadcast(f"\nOUT! Match update:\n  Batter threw {bat_num}, Bowler threw {bowl_num}.\n  Second Innings Score: {bat_score} runs.\n  Target: {self.engine.target} runs.\n\n========================================= TARGET DEFENDED SUCCESSFULLY=========================================\n  MATCH OVER! WINNER: {winner}\n=========================================\n\nDo you want to play again? Enter: PLAY_AGAIN or EXIT\n")
+                        self._log_line(f"result: {winner} wins (defended target)")
                         self.state = "GAME_OVER"
                     else:
                         bat_score = self.engine.player1_score if self.engine.batting_player == self.player1_name else self.engine.player2_score
                         is_over, winner = self.engine.check_second_innings_status()
                         if is_over:
                             self.broadcast(f"\nResult: Batter threw {bat_num}, Bowler threw {bowl_num}.\n  Batter scores {runs_scored} runs!\n  Total Score: {self.engine.batting_player} - {bat_score}/{self.engine.target} runs.\n\n=========================================\n  TARGET CHASED SUCCESSFULLY!\n  MATCH OVER! WINNER: {winner}\n=========================================\n\nDo you want to play again? Enter: PLAY_AGAIN or EXIT\n")
+                            self._log_line(f"result: {winner} wins (chased target)")
                             self.state = "GAME_OVER"
                         else:
                             self.broadcast(f"\nResult: Batter threw {bat_num}, Bowler threw {bowl_num}.\n  Batter scores {runs_scored} runs!\n  Current Score: {self.engine.batting_player} - {bat_score}/{self.engine.target} runs.\n  Runs needed to win: {self.engine.target - bat_score} runs.\n\n")
@@ -319,7 +437,9 @@ class HandCricketServer:
                     self.p2_play_num = None
                     self.p1_replay = None
                     self.p2_replay = None
+                    self.play_deadline = None
                     self.broadcast("\n=========================================\n  STARTING A NEW GAME!\n=========================================\n")
+                    self._start_new_game_log()
                     self.state = "TOSS"
                     self.send_msg(self.player1, protocol.PROMPT_TOSS_P1)
                     self.send_msg(self.player2, f"Waiting for {self.player1_name} to choose ODD/EVEN for the toss...\n")
@@ -396,20 +516,30 @@ class HandCricketServer:
                 self.p2_play_num   = None
                 self.p1_replay     = None
                 self.p2_replay     = None
+                self.play_deadline = None
 
                 self.broadcast("Both players connected! Please register your names to begin.\n")
                 self.send_msg(self.player1, protocol.PROMPT_NAME)
                 self.send_msg(self.player2, protocol.PROMPT_NAME)
 
                 while True:
-                    readable, _, _ = select.select([self.player1, self.player2], [], [])
+                    # 1.0s timeout so we periodically wake up even with no
+                    # socket activity, to check the 45s forfeit timer below.
+                    readable, _, _ = select.select([self.player1, self.player2], [], [], 1.0)
                     disconnect = False
                     for sock in readable:
                         try:
                             messages = self._drain_socket(sock)
                             if messages is None:
+                                # ── Abandonment via ungraceful disconnect ──
+                                exiter_name = self.player1_name if sock == self.player1 else self.player2_name
                                 winner_name = self.player2_name if sock == self.player1 else self.player1_name
-                                self.broadcast(f"\nA player disconnected. {winner_name or 'Opponent'} wins!\n")
+                                if not exiter_name:
+                                    exiter_name = "Player 1" if sock == self.player1 else "Player 2"
+                                if not winner_name:
+                                    winner_name = "Player 2" if sock == self.player1 else "Player 1"
+                                self.broadcast(f"\n{exiter_name} disconnected / abandoned the match. {winner_name} wins by default!\n")
+                                self._log_line(f"result: {winner_name} wins (opponent abandoned)")
                                 self.close_connections()
                                 disconnect = True
                                 break
@@ -424,6 +554,9 @@ class HandCricketServer:
                             disconnect = True
                             break
                     if disconnect or self.state == "CLOSED":
+                        break
+                    self._check_play_timeout()
+                    if self.state == "CLOSED":
                         break
 
             except Exception as e:
